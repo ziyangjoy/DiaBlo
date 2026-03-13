@@ -4,12 +4,26 @@ This repository contains the source code for **DiaBlo**, a parameter-efficient f
 
 ## Method Overview
 
+<p align="center">
+  <img src="Figures/DiaBlo.png" width="600">
+</p>
+
 DiaBlo replaces the full weight update matrix with a block-diagonal structure. Each linear layer receives a trainable block-diagonal adapter `BlockLinear`, which adds a block-diagonal low-rank update to the frozen pretrained weights. This achieves competitive performance with significantly fewer trainable parameters compared to full fine-tuning.
 
 Key features:
 - **Block-diagonal adapters**: Structured weight updates with `num_blocks` diagonal blocks
 - **Adapter merging**: Trained adapters can be merged back into the base model for zero-overhead inference
 - **Multiple benchmarks**: Evaluated on GSM8k, MetaMath, MATH, and 8 commonsense reasoning tasks
+
+## Results
+
+<p align="center">
+  <img src="Figures/Llama2-7B_FEFT.png" width="600">
+</p>
+
+<p align="center">
+  <img src="Figures/Llama2-7B_Quantized_Performance.png" width="600">
+</p>
 
 ## Installation
 
