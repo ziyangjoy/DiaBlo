@@ -126,19 +126,14 @@ python merge.py \
 | `--precision` | Training precision (fp32/fp16/bf16) | bf16 |
 | `--save_adapter_only` | Save only adapter weights | True |
 
-## Supported Models
-
-- LLaMA-2 7B / 13B
-- LLaMA-3 8B / 3B
-- Mistral 7B
-- Qwen 2.5 7B
 
 ## Citation
 
 ```bibtex
-@article{diablo2024,
-    title={DiaBlo: Diagonal Blocks Are Sufficient For Fine-tuning},
-    author={...},
-    year={2024}
+@article{gurses2025diablo,
+  title={DiaBlo: Diagonal Blocks Are Sufficient For Finetuning},
+  author={Gurses, Selcuk and Zhang, Aozhong and Deng, Yanxia and Dong, Xun and Li, Xin and Wang, Naigang and Yin, Penghang and Yang, Zi},
+  journal={International Conference on Learning Representations},
+  year={2026}
 }
 ```
