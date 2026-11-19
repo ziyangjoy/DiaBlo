@@ -100,3 +100,56 @@ def test_adapter_state_dict_filter():
     assert set(adapter_state_dict(sd)) == {
         "model.layers.0.self_attn.q_proj.block_A",
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"}
+
+
+def test_replacement_reuses_frozen_layer_without_copy():
+    """The wrapper keeps the original nn.Linear (no copy, bias kept); block_A is zero in the layer's dtype."""
+    lin = nn.Linear(48, 40, bias=True).half()
+
+    class Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = lin
+
+    h = Holder()
+    replace_linear_with_blocklinear(h, num_blocks=8, target_modules=["q_proj"])
+    assert h.q_proj.linear is lin and h.q_proj.linear.bias is not None
+    assert h.q_proj.block_A.dtype == torch.float16 and h.q_proj.block_A.device == lin.weight.device
+    assert h.q_proj.block_A.abs().sum() == 0 and not h.q_proj.block_A.is_meta
+
+
+def test_param_count_matches_paper_table10():
+    """Table 10 (Llama3.2-3B) lists N=64 -> 27.56M, N=8 -> 220.50M: q,k,v,up,down in units of 2^20."""
+    hidden, inter, kv, layers = 3072, 8192, 1024, 28
+    shapes = [(hidden, hidden), (hidden, kv), (hidden, kv), (hidden, inter), (inter, hidden)]   # q k v up down
+    for n, paper in [(64, 27.56), (8, 220.50), (512, 3.45)]:
+        with torch.device("meta"):
+            per_layer = sum(BlockLinear(i, o, num_blocks=n).block_A.numel() for i, o in shapes)
+        assert round(per_layer * layers / 2**20, 2) == paper
+
+
+def test_eval_prompts_are_training_prefixes():
+    from diablo.prompts import (commonsense_eval_prompt, commonsense_train_prompt, metamath_eval_prompt,
+                                metamath_train_prompt)
+    q = "What is 2+2?"
+    assert metamath_train_prompt(q, "4. The answer is: 4").startswith(metamath_eval_prompt(q))
+    assert metamath_train_prompt(q, "X")[len(metamath_eval_prompt(q)):].startswith("X")
+    assert not metamath_train_prompt(q, "X").startswith(metamath_eval_prompt(q, "upstream"))   # the upstream mismatch
+    assert commonsense_train_prompt(q, "", "the correct answer is true").startswith(commonsense_eval_prompt(q))
+
+
+def _tokenizer(vocab, **special):
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+    tk = Tokenizer(models.WordLevel(vocab, unk_token=special.get("unk_token", "<x>")))
+    return PreTrainedTokenizerFast(tokenizer_object=tk, **special)
+
+
+def test_setup_pad_token_never_grows_vocab():
+    from diablo import setup_pad_token
+    llama2 = _tokenizer({"<unk>": 0, "<s>": 1, "</s>": 2, "a": 3}, unk_token="<unk>", eos_token="</s>")
+    setup_pad_token(llama2)
+    assert llama2.pad_token_id == 0 and len(llama2) == 4
+    llama3 = _tokenizer({"<|end_of_text|>": 0, "a": 1}, eos_token="<|end_of_text|>")
+    setup_pad_token(llama3)
+    assert llama3.pad_token_id == llama3.eos_token_id and len(llama3) == 2

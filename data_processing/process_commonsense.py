@@ -1,7 +1,12 @@
 """
 Preprocess the Commonsense 170k dataset for DiaBlo training.
 
-Requires: commonsense_170k.json (from https://github.com/AGI-Edgerunners/LLM-Adapters)
+Requires: commonsense_170k.json (from https://github.com/AGI-Edgerunners/LLM-Adapters, ft-training_set/)
+
+Like LLM-Adapters (val_set_size=120), 120 shuffled examples are held out, and the rest is saved as
+  <output_dir>/commonsense_170k_new/train_val120_<max_length>_OnlyOutput_<model_name>
+which is what `train.py --task commonsense_new` loads. Prompt/response tokenization and label masking
+are unchanged from upstream (templates now live in diablo/prompts.py).
 
 Usage:
     python data_processing/process_commonsense.py --data_path ./datasets/commonsense_170k.json \
@@ -10,16 +15,25 @@ Usage:
 
 import argparse
 import os
+import sys
 
-import torch
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pyarrow.compute as pc
 from transformers import AutoTokenizer
 from datasets import load_dataset
+
+from diablo.common import model_tag, resolve_model
+from diablo.prompts import commonsense_train_prompt
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_path", type=str, required=True, help="Path to commonsense_170k.json")
 parser.add_argument("--output_dir", type=str, default="./datasets")
-parser.add_argument("--model_name", type=str, default="Llama2-7B")
+parser.add_argument("--model_name", type=str, default="Llama2-7B", help="Short name (diablo/common.py) or HF id")
 parser.add_argument("--max_length", type=int, default=256)
+parser.add_argument("--val_size", type=int, default=120, help="Held-out examples (LLM-Adapters uses 120)")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--num_proc", type=int, default=4)
 parser.add_argument("--model_cache_dir", type=str, default=None)
 parser.add_argument("--hf_token", type=str, default=None)
 args = parser.parse_args()
@@ -30,42 +44,8 @@ if hf_token:
     login(hf_token)
 
 model_dir = args.model_cache_dir or os.environ.get("MODEL_CACHE_DIR", None)
-
-MODEL_MAP = {
-    "Llama2-7B": "meta-llama/Llama-2-7b-hf",
-    "Llama2-13B": "meta-llama/Llama-2-13b-hf",
-    "Llama3-8B": "meta-llama/Meta-Llama-3-8B",
-    "Llama3-3B": "meta-llama/Llama-3.2-3B",
-}
-load_name = MODEL_MAP[args.model_name]
-
-tokenizer = AutoTokenizer.from_pretrained(load_name, cache_dir=model_dir)
-tokenizer.pad_token_id = 0
-tokenizer.padding_side = "left"
-
+tokenizer = AutoTokenizer.from_pretrained(resolve_model(args.model_name), cache_dir=model_dir)
 cutoff_len = args.max_length
-
-
-def generate_prompt(data_point):
-    if data_point["input"]:
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-                ### Instruction:
-                {data_point["instruction"]}
-
-                ### Input:
-                {data_point["input"]}
-
-                ### Response:
-                {data_point["output"]}"""
-    else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
-
-                ### Instruction:
-                {data_point["instruction"]}
-
-                ### Response:
-                {data_point["output"]}"""
 
 
 def tokenize(prompt, add_eos_token=True):
@@ -78,21 +58,31 @@ def tokenize(prompt, add_eos_token=True):
 
 
 def generate_and_tokenize_prompt(data_point):
-    full_prompt = generate_prompt(data_point)
-    tokenized_full_prompt = tokenize(full_prompt)
-
+    full = tokenize(commonsense_train_prompt(data_point["instruction"], data_point["input"], data_point["output"]))
     # Mask input tokens in labels (train only on output)
-    user_prompt = generate_prompt({**data_point, "output": ""})
-    tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
-    user_prompt_len = len(tokenized_user_prompt["input_ids"])
-    tokenized_full_prompt["labels"] = [-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
-
-    return {key: torch.tensor(val) for key, val in tokenized_full_prompt.items()}
+    user_len = len(tokenize(commonsense_train_prompt(data_point["instruction"], data_point["input"], ""),
+                            add_eos_token=False)["input_ids"])
+    full["labels"] = [-100] * user_len + full["labels"][user_len:]
+    return full
 
 
-data = load_dataset("json", data_files=args.data_path)
-train_data = data["train"].shuffle().map(generate_and_tokenize_prompt, num_proc=32)
+# datasets >= 5 starts a worker pool for any num_proc >= 1; spawned workers (Windows/macOS) re-import this file,
+# so the work below must sit under the __main__ guard, and num_proc=1 means "no pool".
+num_proc = args.num_proc if args.num_proc > 1 else None
 
-save_path = os.path.join(args.output_dir, f"commonsense_170k_new/train_all_{cutoff_len}_OnlyOutput_{args.model_name}")
-train_data.save_to_disk(save_path)
-print(f"Dataset saved to {save_path}")
+if __name__ == "__main__":
+    data = load_dataset("json", data_files=args.data_path)["train"]
+    split = data.train_test_split(test_size=args.val_size, shuffle=True, seed=args.seed)
+    cols = data.column_names
+    train_data = split["train"].shuffle(seed=args.seed).map(generate_and_tokenize_prompt, num_proc=num_proc,
+                                                             remove_columns=cols)
+    val_data = split["test"].map(generate_and_tokenize_prompt, remove_columns=cols)
+
+    base = os.path.join(args.output_dir, "commonsense_170k_new")
+    tag = f"{cutoff_len}_OnlyOutput_{model_tag(args.model_name)}"
+    train_data.save_to_disk(os.path.join(base, f"train_val{args.val_size}_{tag}"))
+    val_data.save_to_disk(os.path.join(base, f"val{args.val_size}_{tag}"))
+    lens = pc.list_value_length(train_data.data.column("input_ids")).to_numpy()
+    print(f"{len(train_data)} train / {len(val_data)} val examples | mean len {lens.mean():.1f} | "
+          f"truncated at {cutoff_len}: {int((lens >= cutoff_len).sum())}")
+    print(f"Saved to {base}/train_val{args.val_size}_{tag}")

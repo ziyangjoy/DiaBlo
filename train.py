@@ -8,11 +8,14 @@ Usage:
 """
 
 import os
+import sys
 import json
+import time
+import shutil
 import argparse
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback, set_seed
 from datasets import load_from_disk
 import datasets.features.features as _dff
 if "List" not in _dff._FEATURE_TYPES:
@@ -21,6 +24,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from diablo import (CustomTrainer, CustomTrainingArguments, resolve_model, parse_target_modules,
                     setup_pad_token, apply_adapter, mark_trainable)
+from diablo.common import train_data_paths
 
 # ── Argument parsing ────────────────────────────────────────────────────────
 
@@ -69,6 +73,8 @@ parser.add_argument("--save_steps", type=int, default=100, help="Checkpoint ever
 parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
 parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output dir")
 parser.add_argument("--report_to", type=str, default="none", help="none | wandb | tensorboard")
+parser.add_argument("--deadline", type=float, default=None,
+                    help="Unix time. Checkpoint and exit with code 3 before it (Slurm segments of long runs)")
 
 # Layer selection
 parser.add_argument("--layer_min", type=int, default=0, help="Min layer index to apply adapters")
@@ -149,27 +155,12 @@ if args.load_in_4bit:
 pad_token_id = tokenizer.pad_token_id
 padding_side = "left"
 
-if args.task == "GSM8k":
-    training_data = load_from_disk(os.path.join(args.data_dir, "GSM8k_processed/train"))
-    validation_data = None
-elif args.task == "GSM8k_lori":
-    training_data = load_from_disk(os.path.join(args.data_dir, f"gsm8k_lori_shuffle_{args.model_name}_special_token"))
+train_path, val_path = train_data_paths(args.data_dir, args.task, args.model_name, args.max_length)
+training_data = load_from_disk(train_path)
+validation_data = load_from_disk(val_path) if val_path else None
+if args.task == "GSM8k_lori":
     n_keep = (len(training_data) // args.per_device_batch_size // args.gradient_accumulation_steps) * args.per_device_batch_size * args.gradient_accumulation_steps
     training_data = training_data.select(range(n_keep))
-    validation_data = None
-elif args.task == "metamath":
-    training_data = load_from_disk(os.path.join(args.data_dir, f"metamath/train_all_{args.max_length}_OnlyOutput"))
-    validation_data = None
-elif args.task == "commonsense":
-    training_data = load_from_disk(
-        os.path.join(args.data_dir, f"commonsense_170k_new/train_all_{args.max_length}_OnlyOutput_{args.model_name}"))
-    validation_data = load_from_disk(os.path.join(args.data_dir, "dataset_commonsense/combined_val_0.1_512"))
-elif args.task == "commonsense_new":
-    training_data = load_from_disk(
-        os.path.join(args.data_dir, f"commonsense_170k_new/train_val120_{args.max_length}_OnlyOutput_{args.model_name}"))
-    validation_data = None
-else:
-    raise ValueError(f"Unknown task: {args.task}")
 
 
 def collate_fn(batch):
@@ -245,13 +236,72 @@ trainer = CustomTrainer(
     data_collator=collate_fn,
 )
 
+class DeadlineCallback(TrainerCallback):
+    """Save a checkpoint and stop when the next two steps might not finish before the deadline.
+
+    A job killed by Slurm in the middle of a checkpoint save leaves a broken checkpoint. Stopping
+    ourselves first means every segment of a multi-day run ends on a complete checkpoint.
+    """
+
+    def __init__(self, deadline):
+        self.deadline, self.t_prev, self.step_s, self.stopped = deadline, None, 0.0, False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        now = time.time()
+        if self.t_prev is not None:
+            self.step_s = max(self.step_s, now - self.t_prev)
+        self.t_prev = now
+        if now + 2 * self.step_s + 60 > self.deadline:
+            control.should_save = True
+            control.should_training_stop = True
+            self.stopped = True
+            print(f"Deadline reached at step {state.global_step}: saving checkpoint and stopping.", flush=True)
+        return control
+
+
+deadline_cb = DeadlineCallback(args.deadline) if args.deadline else None
+if deadline_cb:
+    trainer.add_callback(deadline_cb)
+
 resume = None
 if args.resume:
     from transformers.trainer_utils import get_last_checkpoint
+    # HF writes trainer_state.json last, so a checkpoint without it was cut off mid-save (killed job).
+    for d in os.listdir(output_dir):
+        p = os.path.join(output_dir, d)
+        if d.startswith("checkpoint-") and os.path.isdir(p) and not os.path.exists(os.path.join(p, "trainer_state.json")):
+            print(f"Removing incomplete checkpoint {p}")
+            shutil.rmtree(p)
     resume = get_last_checkpoint(output_dir)
     print(f"Resuming from: {resume}" if resume else "No checkpoint found, starting fresh.")
 
-trainer.train(resume_from_checkpoint=resume)
+start_step = 0
+if resume:
+    with open(os.path.join(resume, "trainer_state.json")) as f:
+        start_step = json.load(f)["global_step"]
+if torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
+out = trainer.train(resume_from_checkpoint=resume)
+
+# Timing/memory of this process (one Slurm segment); scripts/slurm/bench.sbatch projects run cost from it.
+steps_per_epoch = len(training_data) // (args.per_device_batch_size * args.gradient_accumulation_steps)
+stats = {"steps_this_process": trainer.state.global_step - start_step, "global_step": trainer.state.global_step,
+         "max_steps": trainer.state.max_steps, "steps_per_epoch": steps_per_epoch, "n_train": len(training_data),
+         "train_runtime_s": out.metrics.get("train_runtime"),
+         "peak_mem_gb": torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else None,
+         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
+if stats["steps_this_process"] > 0 and stats["train_runtime_s"]:
+    stats["s_per_step"] = stats["train_runtime_s"] / stats["steps_this_process"]
+print("TRAIN_STATS " + json.dumps(stats))
+with open(os.path.join(output_dir, "train_stats.json"), "w") as f:
+    json.dump(stats, f, indent=2)
+
+if trainer.state.global_step < trainer.state.max_steps:
+    # Stopped by the deadline: the checkpoint is saved, but the run is not finished. No final adapter,
+    # no log_history.json (those mark a finished run). The next segment resumes with --resume.
+    print(f"Segment finished at step {trainer.state.global_step}/{trainer.state.max_steps}; resume to continue.")
+    sys.exit(3)
+
 trainer.save_model(output_dir)  # final adapter.chkpt at output_dir root
 with open(os.path.join(output_dir, "log_history.json"), "w") as f:
     json.dump(trainer.state.log_history, f, indent=2)

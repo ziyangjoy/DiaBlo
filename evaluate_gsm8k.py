@@ -95,6 +95,8 @@ print(f"{len(done)} already evaluated, {len(todo)} to go.")
 gen_kwargs = {"max_new_tokens": args.max_new_tokens, "do_sample": False,
               "pad_token_id": tokenizer.pad_token_id}
 
+import time
+t_gen = time.time()
 with torch.no_grad(), open(args.output_file, "a") as fout:
     for start in tqdm(range(0, len(todo), args.batch_size), desc="Evaluating GSM8k"):
         idxs = todo[start: start + args.batch_size]
@@ -109,7 +111,8 @@ with torch.no_grad(), open(args.output_file, "a") as fout:
 
 records = load_jsonl(args.output_file)
 summary = summarize(records, n_test if not args.limit else len(test_data))
-summary.update({"model": load_name, "method": args.method, "adapter": args.adapter_path, "backend": "hf"})
+summary.update({"model": load_name, "method": args.method, "adapter": args.adapter_path, "backend": "hf",
+                "seconds": round(time.time() - t_gen, 1), "generated": len(todo)})
 print(json.dumps(summary, indent=2))
 with open(args.output_file.replace(".jsonl", "") + "_summary.json", "w") as f:
     json.dump(summary, f, indent=2)

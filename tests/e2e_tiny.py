@@ -93,4 +93,74 @@ for method, extra in [("diablo", ["--num_blocks", "4"]), ("lora", ["--lora_r", "
     print(f"[{method}] adapter vs merged generations identical: {same}/6")
     assert same == 6, "merged model diverges from adapter model"
 
+# 3. Slurm segments: a past deadline stops after one step on a saved checkpoint (exit 3), a half-written checkpoint
+#    is removed, and --resume finishes the run.
+import shutil
+import time
+
+name = "e2e_deadline"
+rd = os.path.join(out_dir, name)
+shutil.rmtree(rd, ignore_errors=True)
+args_d = [*common, "--method", "diablo", "--num_blocks", "4", "--run_name", name, "--max_steps", "6"]
+r = subprocess.run([sys.executable, "train.py", *args_d, "--deadline", str(time.time() - 1)], cwd=REPO,
+                   capture_output=True, text=True)
+assert r.returncode == 3, f"expected exit 3, got {r.returncode}\n{r.stdout[-2000:]}\n{r.stderr[-3000:]}"
+assert not os.path.exists(os.path.join(rd, "log_history.json")), "a stopped segment must not look finished"
+assert sorted(d for d in os.listdir(rd) if d.startswith("checkpoint-")) == ["checkpoint-1"]
+os.makedirs(os.path.join(rd, "checkpoint-2"))          # cut off mid-save: no trainer_state.json
+log = run("train.py", *args_d, "--resume")
+assert "Removing incomplete checkpoint" in log and "Resumed adapter weights" in log, log[-2000:]
+assert json.load(open(os.path.join(rd, "train_stats.json")))["global_step"] == 6
+print("[deadline] stop -> exit 3 -> cleanup -> resume OK")
+
+# 4. Commonsense: process_commonsense -> train --task commonsense_new -> evaluate_commonsense (all 8, resumable)
+cs = [{"instruction": f"Please answer the following question with true or false, question: is {i} even?\n\n"
+                      "Answer format: true/false", "input": "",
+       "output": f"the correct answer is {'true' if i % 2 == 0 else 'false'}",
+       "answer": "true" if i % 2 == 0 else "false"} for i in range(130)]
+json.dump(cs, open(os.path.join(W, "cs170k.json"), "w"))
+run("data_processing/process_commonsense.py", "--data_path", os.path.join(W, "cs170k.json"), "--output_dir", data_dir,
+    "--model_name", model_dir, "--val_size", "120", "--num_proc", "1")
+shutil.rmtree(os.path.join(out_dir, "e2e_cs"), ignore_errors=True)
+run("train.py", "--model_name", model_dir, "--data_dir", data_dir, "--output_dir", out_dir, "--task", "commonsense_new",
+    "--max_length", "256", "--precision", a.precision, "--per_device_batch_size", "2", "--gradient_accumulation_steps", "2",
+    "--warmup_steps", "1", "--lr", "1e-2", "--method", "diablo", "--num_blocks", "4", "--run_name", "e2e_cs",
+    "--max_steps", "3")
+shared = os.path.join(W, "shared")
+answers = {"boolq": "true", "piqa": "solution1", "social_i_qa": "answer2", "hellaswag": "ending3",
+           "winogrande": "option1", "ARC-Easy": "answer1", "ARC-Challenge": "answer4", "openbookqa": "answer3"}
+for d, ans in answers.items():
+    os.makedirs(os.path.join(shared, "dataset_commonsense", d), exist_ok=True)
+    json.dump([{"instruction": f"{d} question {i}?", "input": "", "output": f"the correct answer is {ans}", "answer": ans}
+               for i in range(3)], open(os.path.join(shared, "dataset_commonsense", d, "test.json"), "w"))
+cs_adapter = ["--adapter_path", os.path.join(out_dir, "e2e_cs", "adapter.chkpt")]
+ev_cs = ["--model_name", model_dir, "--method", "diablo", *cs_adapter, "--data_dir", shared, "--precision", "fp32",
+         "--batch_size", "2", "--output_dir", os.path.join(W, "eval_cs")]
+shutil.rmtree(os.path.join(W, "eval_cs"), ignore_errors=True)
+run("evaluate_commonsense.py", *ev_cs, "--num_blocks", "4")
+s = json.load(open(os.path.join(W, "eval_cs", "summary.json")))
+assert s["complete"] and all(v["n"] == 3 for v in s["datasets"].values()), s
+run("evaluate_commonsense.py", *ev_cs, "--num_blocks", "4")            # resume: nothing left to generate
+s = json.load(open(os.path.join(W, "eval_cs", "summary.json")))
+assert all(v["generated"] == 0 for v in s["datasets"].values()), s
+bad = subprocess.run([sys.executable, "evaluate_commonsense.py", *ev_cs, "--num_blocks", "8",
+                      "--output_dir", os.path.join(W, "eval_cs_bad")], cwd=REPO, capture_output=True, text=True)
+assert bad.returncode != 0, "a wrong --num_blocks must fail the strict adapter check"
+print(f"[commonsense] process -> train -> eval OK, avg {s['average']:.2f}; resume OK; wrong N rejected")
+
+# 5. Math eval (GSM8K + MATH files in the LLM-Adapters / MetaMath formats), base model, both prompt styles
+os.makedirs(os.path.join(shared, "dataset_math", "gsm8k"), exist_ok=True)
+json.dump([{"instruction": f"What is {i} + {i}?", "input": "", "output": "", "answer": str(2 * i)} for i in range(3)],
+          open(os.path.join(shared, "dataset_math", "gsm8k", "test.json"), "w"))
+json.dump([{"instruction": f"Compute {i}*2.", "output": f"It is $\\boxed{{{2 * i}}}$."} for i in range(2)],
+          open(os.path.join(shared, "MATH_test.json"), "w"))
+for style in ("train", "upstream"):
+    od = os.path.join(W, f"eval_math_{style}")
+    shutil.rmtree(od, ignore_errors=True)
+    run("evaluate_math.py", "--model_name", model_dir, "--method", "none", "--data_dir", shared, "--precision", "fp32",
+        "--batch_size", "2", "--num_beams", "2", "--prompt_style", style, "--output_dir", od)
+    s = json.load(open(os.path.join(od, "summary.json")))
+    assert s["complete"] and s["datasets"]["gsm8k"]["n"] == 3 and s["datasets"]["MATH"]["n"] == 2, s
+print("[math] evaluate_math OK (train and upstream prompts)")
+
 print("\nE2E OK")

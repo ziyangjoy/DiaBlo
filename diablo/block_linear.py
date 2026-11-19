@@ -107,22 +107,21 @@ def replace_linear_with_blocklinear(
 
     for name, module in model.named_children():
         if isinstance(module, nn.Linear) and (target_modules is None or name in target_modules):
-            in_features = module.in_features
-            out_features = module.out_features
-
-            new_layer = BlockLinear(
-                in_features=in_features,
-                out_features=out_features,
-                num_blocks=num_blocks,
-                bias=module.bias is not None,
-                drop_out=drop_out,
-            )
-
-            new_layer.linear.weight.data = module.weight.data.clone()
-            if module.bias is not None:
-                new_layer.linear.bias.data = module.bias.data.clone()
-
-            new_layer.to(module.weight.device).to(module.weight.dtype)
+            # Build the wrapper on the meta device and reuse the frozen layer itself. Upstream allocated
+            # and randomly initialised a fresh fp32 nn.Linear per projection and then copied the weights
+            # in, which costs minutes and GBs of RAM on a 7B model. The result is identical: same frozen
+            # weight/bias, zero-initialised block_A in the layer's dtype and device.
+            with torch.device("meta"):
+                new_layer = BlockLinear(
+                    in_features=module.in_features,
+                    out_features=module.out_features,
+                    num_blocks=num_blocks,
+                    bias=module.bias is not None,
+                    drop_out=drop_out,
+                )
+            new_layer.linear = module
+            new_layer.block_A = nn.Parameter(torch.zeros(new_layer.block_A.shape, device=module.weight.device,
+                                                         dtype=module.weight.dtype))
             setattr(model, name, new_layer)
         else:
             replace_linear_with_blocklinear(
